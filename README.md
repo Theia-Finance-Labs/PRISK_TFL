@@ -1,9 +1,9 @@
-# climate.risk.tool
+# PRISK climate.risk.tool
 
 <!-- badges: start -->
 <!-- badges: end -->
 
-R package for climate risk assessment using geospatial hazard data and financial modeling. Supports GeoTIFF (.tif), NetCDF (.nc), and CSV hazard data formats with automated ensemble statistics extraction and multi-format pipeline handling.
+R package for PRISK climate risk assessment using geospatial hazard data and financial modeling. Supports GeoTIFF (.tif), NetCDF (.nc), and CSV hazard data formats with automated ensemble statistics extraction and multi-format pipeline handling.
 
 Created with the support of AI tools.
 
