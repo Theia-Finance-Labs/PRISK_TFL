@@ -436,3 +436,18 @@ This Python notebook:
 - **Real-time matching**: Small datasets, maximum precision requirements, custom geometries, assets with coordinates
 
 The tool seamlessly handles both approaches, allowing mixed usage in the same analysis pipeline. Assets with coordinates use spatial extraction, while assets with only regional information use pre-computed statistics.
+
+## Third-party data
+
+The model is not tied to a specific dataset, but in our applications we often use hazard, land-cover and boundary data from the sources listed below. These datasets are **not included in this repository**. Users must obtain them directly from the providers and comply with their licence terms, including the required attribution.
+
+| Data | Provider | Licence | Required attribution / citation |
+|---|---|---|---|
+| Flood maps | Global Infrastructure Risk Model and Resilience Index (GIRI) | [CC BY 3.0 IGO](https://creativecommons.org/licenses/by/3.0/igo/) | CDRI (2023). *Global Infrastructure Resilience: Capturing the resilience dividend – A Biennial Report from the Coalition for Disaster Resilient Infrastructure*, New Delhi. |
+| Heat maps | World Bank Climate Change Knowledge Portal (CCKP) | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) | The World Bank: Heat Index Indicators: CMIP6. |
+| Drought maps | Harvard Dataverse | [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) | de Alcantara Araujo, D. S.; Nikolopoulos, E. (2025). *Global 0.25-Degree Future Drought Layers (1980–2100) Based on Downscaled CMIP6 Models and SSP-RCP Combinations*, Version 1. Harvard Dataverse, V3. https://doi.org/10.7910/DVN/05FVSE |
+| Administrative regions | geoBoundaries | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) | Runfola, D. et al. (2020). geoBoundaries: A global database of political administrative boundaries. *PLoS ONE* 15(4): e0231866. https://doi.org/10.1371/journal.pone.0231866 |
+| Land cover (Brazil) | MapBiomas | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) | MapBiomas Project – Collection of the Annual Series of Land Cover and Land Use Maps of Brazil, accessed in 2025 via https://mapbiomas.org/en/ |
+| River basins | HydroBASINS (HydroSHEDS) | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) | Lehner, B., Roth, A., Huber, M., Anand, M., Thieme, M. (2022). A sharper look at the world's rivers and catchments. *Eos*, 103. https://doi.org/10.1029/2022EO220167 |
+
+Licence summaries are for orientation only; the provider's own licence terms apply.
