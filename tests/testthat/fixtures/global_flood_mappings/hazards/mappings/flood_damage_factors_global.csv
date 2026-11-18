@@ -1,0 +1,13 @@
+region,asset_category,flood_depth_cm,damage_factor,business_disruption
+Central & South America,commercial building,0,0.01,1
+Central & South America,commercial building,50,0.05,5
+Central & South America,commercial building,100,0.1,10
+North America,commercial building,0,0.02,2
+North America,commercial building,50,0.06,6
+North America,commercial building,100,0.11,11
+Global,commercial building,0,0.015,1.5
+Global,commercial building,50,0.055,5.5
+Global,commercial building,100,0.105,10.5
+Global,agriculture,0,0.03,3
+Global,agriculture,50,0.07,7
+Global,agriculture,100,0.12,12

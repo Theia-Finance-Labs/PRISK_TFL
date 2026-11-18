@@ -1,0 +1,79 @@
+#' Compute Yearly Baseline Revenue Trajectories for Assets
+#'
+#' @title Compute Yearly Baseline Revenue Trajectories
+#' @description Computes yearly baseline revenue trajectories for assets from 2025 onwards.
+#'   Starting with 2025 revenues = company_revenue * share_of_economic_activity,
+#'   then applying growth rate for subsequent years: 2026 = 2025 * (1 + growth_rate), etc.
+#' @param baseline_assets tibble with columns: asset, company, share_of_economic_activity
+#' @param companies tibble with columns: company, revenues
+#' @param growth_rate numeric. Annual growth rate (default: 0.02)
+#' @param start_year numeric. Starting year for projections (default: 2025)
+#' @param end_year numeric. Ending year for projections (default: 2050)
+#' @return tibble with columns: asset, company, year, revenue
+#' @examples
+#' \dontrun{
+#' baseline_assets <- data.frame(
+#'   asset = c("A1", "A2"),
+#'   company = c("C1", "C1"),
+#'   share_of_economic_activity = c(0.6, 0.4)
+#' )
+#' companies <- data.frame(
+#'   company = "C1",
+#'   revenues = 1000
+#' )
+#' result <- compute_yearly_baseline_revenue(baseline_assets, companies, 0.02)
+#' }
+#' @export
+compute_yearly_baseline_revenue <- function(
+  baseline_assets,
+  companies,
+  growth_rate = 0.02,
+  start_year = 2025,
+  end_year = 2050
+) {
+  # Join assets with company data
+  assets_with_companies <- dplyr::left_join(baseline_assets, companies, by = "company")
+
+  # Check for any failed joins
+  revenue_col <- assets_with_companies |> dplyr::pull(.data$revenues)
+  if (any(is.na(revenue_col))) {
+    stop("Join failed: some assets could not be matched to companies")
+  }
+
+  # Calculate 2025 baseline revenue for each asset
+  # Formula: company_revenue * share_of_economic_activity
+  assets_with_companies <- assets_with_companies |>
+    dplyr::mutate(revenue_2025 = .data$revenues * .data$share_of_economic_activity)
+
+  # Resolve effective growth rate: use per-asset value when available, else global default
+  if ("growth_rate" %in% names(assets_with_companies)) {
+    assets_with_companies <- assets_with_companies |>
+      dplyr::mutate(
+        # .env$growth_rate explicitly references the function parameter,
+        # not the column of the same name
+        .effective_growth_rate = dplyr::if_else(
+          is.na(.data$growth_rate),
+          .env$growth_rate,
+          .data$growth_rate
+        )
+      )
+  } else {
+    assets_with_companies <- assets_with_companies |>
+      dplyr::mutate(.effective_growth_rate = growth_rate)
+  }
+
+  # Generate yearly trajectories
+  years <- start_year:end_year
+
+  # Create expanded data frame with one row per asset-year combination
+  # First expand each asset to have one row per year
+  result <- assets_with_companies |>
+    dplyr::mutate(year = list(years)) |>
+    tidyr::unnest("year") |>
+    # Apply effective growth rate (per-asset if set, else global default)
+    dplyr::mutate(revenue = .data$revenue_2025 * (1 + .data$.effective_growth_rate)^(.data$year - start_year)) |>
+    dplyr::select("asset", "company", "year", "revenue")
+
+
+  return(result)
+}

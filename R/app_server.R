@@ -1,0 +1,773 @@
+#' The application server-side
+#'
+#' @param input,output,session Internal parameters for shiny.
+#'     DO NOT REMOVE.
+#' @import shiny
+#' @noRd
+app_server <- function(input, output, session) {
+  # Reactive values to track state
+  values <- reactiveValues(
+    data_loaded = FALSE,
+    results = NULL,
+    results_uncertainty = NULL,
+    run_events = NULL,
+    status = "Ready to load data",
+    # Store all loaded data files
+    assets = NULL,
+    hazards = NULL,
+    hazards_inventory = NULL,
+    precomputed_hazards = NULL,
+    hazard_configs = NULL,
+    cnae_exposure = NULL,
+    adm1_boundaries = NULL,
+    adm2_boundaries = NULL,
+    region_name_mapping = NULL,
+    spatial_separation_data = NULL,
+    spatial_separation_warnings = character(),
+    # TRISK-PRISK Integration mode state -- kept completely separate from the
+    # Physical Risk Analysis mode's `results`/`assets`/etc above.
+    trisk_prisk_results = NULL,
+    trisk_prisk_joined = NULL,
+    trisk_prisk_status = "Select a PRISK input folder and a TRISK output file, then click Run."
+  )
+  settings_modal_open <- shiny::reactiveVal(FALSE)
+
+  # Region toggle: "brazil" (default, full existing pipeline) or "global"
+  # (flood-hazard-only, global flood rasters, no Brazil ADM/spatial-separation data)
+  # -- only relevant in Physical Risk Analysis mode.
+  region <- shiny::reactive({
+    v <- input$region
+    if (is.null(v) || !nzchar(v)) "brazil" else v
+  })
+
+  # App Mode toggle: "prisk" (default, the existing Region-driven single-hazard
+  # flood tool, completely unchanged) or "trisk_prisk" (the new TRISK-PRISK
+  # Integration mode below). Independent of `region`, which only applies to
+  # "prisk" mode.
+  app_mode <- shiny::reactive({
+    v <- input$app_mode
+    if (is.null(v) || !nzchar(v)) "prisk" else v
+  })
+
+  # Create the reactive variables expected by tests
+  data_loaded <- reactive({
+    values$data_loaded
+  })
+  results_ready <- reactive({
+    !is.null(values$results)
+  })
+  results <- reactive({
+    values$results
+  })
+
+  # Get base_dir from golem options
+  get_base_dir <- reactive({
+    golem_base_dir <- golem::get_golem_options("base_dir")
+    if (!is.null(golem_base_dir) && golem_base_dir != "") {
+      return(golem_base_dir)
+    }
+
+    # Fallback: try to get from environment variable (useful for testing)
+    env_base_dir <- Sys.getenv("CLIMATE_RISK_BASE_DIR")
+    if (env_base_dir != "") {
+      return(env_base_dir)
+    }
+
+    return(NULL)
+  })
+
+  overrides_reload <- shiny::reactiveVal(0L)
+
+  settings_configs <- shiny::reactive({
+    base_dir <- get_base_dir()
+    overrides_reload()
+    if (is.null(base_dir) || base_dir == "") {
+      return(NULL)
+    }
+
+    hazards_dir <- file.path(base_dir, "hazards", "config")
+    if (!dir.exists(hazards_dir)) {
+      return(NULL)
+    }
+
+    load_hazard_configs(
+      hazards_dir = hazards_dir,
+      hazards_override_path = file.path(hazards_dir, "config_overrides.yml")
+    )
+  })
+
+  # Initialize settings module
+  settings <- mod_settings_server(
+    "settings",
+    base_dir_reactive = get_base_dir,
+    hazard_configs_reactive = settings_configs,
+    inventory_reactive = control$hazards_inventory
+  )
+
+  shiny::observeEvent(settings$reload_trigger(), {
+    overrides_reload(settings$reload_trigger())
+  })
+
+  shiny::observeEvent(input$open_settings, {
+    shiny::showModal(
+      shiny::modalDialog(
+        title = "Hazards Settings",
+        mod_settings_ui("settings"),
+        size = "l",
+        easyClose = TRUE,
+        footer = NULL,
+        class = "settings-modal"
+      )
+    )
+    settings_modal_open(TRUE)
+  })
+
+  shiny::observeEvent(input$main_tabs, {
+    if (isTRUE(settings_modal_open())) {
+      shiny::removeModal()
+      settings_modal_open(FALSE)
+    }
+  }, ignoreInit = TRUE)
+
+  # Initialize control module
+  control <- mod_control_server(
+    "control",
+    base_dir_reactive = get_base_dir,
+    overrides_reload = overrides_reload,
+    spatial_data_reactive = reactive({
+      values$spatial_separation_data
+    }),
+    region_reactive = region
+  )
+
+  # Force a full static-data reload when the region toggle changes (e.g. switching
+  # from Brazil to Global needs to drop ADM boundaries and reload the flood-only config)
+  shiny::observeEvent(region(), {
+    values$data_loaded <- FALSE
+  }, ignoreInit = TRUE)
+
+  # ==========================================================================
+  # TRISK-PRISK Integration mode -- a separate top-level flow (see app_mode
+  # above). Reuses read_assets()/read_companies()/compute_risk_trisk_prisk()
+  # and everything they call unmodified; never touches compute_risk(),
+  # compute_risk_probabilistic(), or the Region-driven state above.
+  # ==========================================================================
+
+  # TRISK-PRISK always uses the Global flood config (not the Region toggle,
+  # which only applies to Physical Risk Analysis mode): TRISK portfolios are
+  # typically international, and the Global flood dataset covers any country,
+  # unlike the Brazil-only one. Cached like mod_control_server's own
+  # hazards_and_inventory reactive -- only recomputes when base_dir changes,
+  # not on every "Run" click.
+  trisk_prisk_hazards_and_inventory <- shiny::reactive({
+    base_dir <- get_base_dir()
+    if (is.null(base_dir) || base_dir == "") {
+      return(NULL)
+    }
+    hazards_dir <- resolve_hazards_dir(base_dir, "global")
+    indicators_dir <- file.path(base_dir, "hazards", "indicators")
+    if (!dir.exists(hazards_dir) || !dir.exists(indicators_dir)) {
+      return(NULL)
+    }
+
+    result <- try(
+      load_hazards_and_inventory(
+        hazards_dir = hazards_dir,
+        hazard_indicators_dir = indicators_dir,
+        hazards_override_path = file.path(hazards_dir, "config_overrides.yml"),
+        aggregate_factor = 1L
+      ),
+      silent = TRUE
+    )
+    if (inherits(result, "try-error") || !is.list(result)) {
+      message(
+        "[app_server] Error loading TRISK-PRISK (Global flood) hazards: ",
+        if (inherits(result, "try-error")) attr(result, "condition")$message else "unknown"
+      )
+      return(NULL)
+    }
+    result
+  })
+
+  trisk_prisk_control <- mod_trisk_prisk_control_server(
+    "trisk_prisk_control",
+    base_dir_reactive = get_base_dir,
+    status_reactive = reactive({ values$trisk_prisk_status })
+  )
+
+  mod_trisk_prisk_asset_analysis_server(
+    "trisk_prisk_asset_analysis",
+    results_reactive = reactive({ values$trisk_prisk_results }),
+    trisk_joined_reactive = reactive({ values$trisk_prisk_joined })
+  )
+
+  mod_trisk_prisk_pathways_server(
+    "trisk_prisk_pathways",
+    results_reactive = reactive({ values$trisk_prisk_results }),
+    trisk_joined_reactive = reactive({ values$trisk_prisk_joined })
+  )
+
+  mod_trisk_prisk_outputs_server(
+    "trisk_prisk_outputs",
+    results_reactive = reactive({ values$trisk_prisk_results })
+  )
+
+  shiny::observeEvent(trisk_prisk_control$run_trigger(), {
+    base_dir <- get_base_dir()
+    prisk_folder <- trisk_prisk_control$prisk_folder()
+    trisk_file <- trisk_prisk_control$trisk_file_path()
+
+    if (is.null(base_dir) || base_dir == "") {
+      values$trisk_prisk_status <- "Error: Base directory is not set. Please restart the app with a valid base_dir."
+      return()
+    }
+    if (is.null(prisk_folder) || prisk_folder == "") {
+      values$trisk_prisk_status <- "Error: Please select a PRISK input folder first."
+      return()
+    }
+    if (is.null(trisk_file)) {
+      values$trisk_prisk_status <- "Error: Please select a TRISK output file (company_trajectories.csv or .xlsx) first."
+      return()
+    }
+    if (!isTRUE(trisk_prisk_control$hazard_added())) {
+      values$trisk_prisk_status <- "Error: Please select a hazard type and click 'Add Hazard' before running."
+      return()
+    }
+
+    file_status <- resolve_input_file_status(prisk_folder)
+    asset_ok <- file_status$asset$status %in% c("legacy", "new")
+    company_ok <- file_status$company$status %in% c("legacy", "new")
+    if (!asset_ok || !company_ok) {
+      values$trisk_prisk_status <- "Error: Selected PRISK folder is missing required asset/company input files (assets.xlsx/csv + financials.xlsx/csv + portfolio.xlsx/csv)."
+      return()
+    }
+
+    hazard_data <- trisk_prisk_hazards_and_inventory()
+    if (is.null(hazard_data)) {
+      values$trisk_prisk_status <- "Error: Could not load the Global flood hazard data. Check that base_dir/hazards/config_global exists."
+      return()
+    }
+
+    values$trisk_prisk_status <- "Running TRISK-PRISK analysis..."
+
+    tryCatch(
+      {
+        progress <- shiny::Progress$new(session, min = 0, max = 1)
+        progress$set(message = "Loading inputs...", value = 0)
+        on.exit(progress$close(), add = TRUE)
+
+        prisk_assets <- read_assets(prisk_folder)
+        prisk_companies <- read_companies(prisk_folder)
+        trisk_raw <- read_trisk_output(trisk_file$datapath)
+        trisk_joined <- join_trisk_to_prisk_assets(trisk_raw, prisk_assets)
+
+        progress$set(value = 0.1, detail = "Computing physical-risk-adjusted pathways...")
+
+        # precomputed_hazards is already loaded (and kept up to date) by the
+        # main load_all_static_files()/observe() block below, resolved against
+        # the Brazil config regardless of region for the same reason it's
+        # reused there: structurally required by the shared extraction
+        # machinery but never actually queried for coordinate-based assets.
+        results <- compute_risk_trisk_prisk(
+          trisk_joined = trisk_joined,
+          companies = prisk_companies,
+          hazards = hazard_data$hazards,
+          hazards_inventory = hazard_data$inventory,
+          hazard_configs = hazard_data$configs,
+          hazards_dir = resolve_hazards_dir(base_dir, "global"),
+          precomputed_hazards = values$precomputed_hazards,
+          growth_rate = trisk_prisk_control$growth_rate(),
+          discount_rate = trisk_prisk_control$discount_rate(),
+          risk_free_rate = trisk_prisk_control$risk_free_rate(),
+          include_terminal_value = trisk_prisk_control$include_terminal_value(),
+          on_progress = function(value, msg) {
+            progress$set(value = 0.1 + value * 0.9, detail = msg)
+          }
+        )
+
+        values$trisk_prisk_results <- results
+        values$trisk_prisk_joined <- trisk_joined
+        values$trisk_prisk_status <- "Analysis complete. See the Profit Pathways and Outputs tabs."
+      },
+      error = function(e) {
+        log_error_to_console(e, "TRISK-PRISK analysis")
+        values$trisk_prisk_status <- paste0("Error: ", conditionMessage(e))
+      }
+    )
+  })
+
+  run_repro_spec <- shiny::reactive({
+    events <- try(control$events(), silent = TRUE)
+    if (inherits(events, "try-error")) {
+      events <- NULL
+    }
+
+    list(
+      base_dir = get_base_dir(),
+      input_folder = control$input_folder(),
+      events = events,
+      growth_rate = control$growth_rate(),
+      discount_rate = control$discount_rate(),
+      risk_free_rate = control$risk_free_rate()
+    )
+  })
+
+  # Initialize status module
+  mod_status_server(
+    "status",
+    status_reactive = reactive({
+      values$status
+    }),
+    events_reactive = control$events,
+    delete_event_callback = control$delete_event,
+    run_repro_code_reactive = shiny::reactive({
+      build_run_repro_code(run_repro_spec())
+    }),
+    spatial_data_reactive = reactive({
+      values$spatial_separation_data
+    }),
+    region_reactive = region,
+    assets_reactive = reactive({
+      values$assets
+    })
+  )
+
+  # Initialize results modules
+  mod_results_assets_server(
+    "results_assets",
+    results_reactive = results,
+    name_mapping_reactive = reactive({
+      values$region_name_mapping
+    }),
+    cnae_exposure_reactive = reactive({
+      values$cnae_exposure
+    }),
+    events_reactive = reactive({
+      values$run_events
+    }),
+    uncertainty_mode_reactive = shiny::reactive({ settings$uncertainty_mode() }),
+    uncertainty_results_reactive = shiny::reactive({ values$results_uncertainty }),
+    hazard_configs_reactive = settings_configs
+  )
+  # Initialize plot modules
+  mod_profit_pathways_server(
+    "profit_pathways",
+    results_reactive = results,
+    cnae_exposure_reactive = reactive({
+      values$cnae_exposure
+    }),
+    uncertainty_mode_reactive = shiny::reactive({ settings$uncertainty_mode() }),
+    uncertainty_results_reactive = shiny::reactive({ values$results_uncertainty })
+  )
+
+  mod_company_analysis_server(
+    "company_analysis",
+    results_reactive = results,
+    uncertainty_mode_reactive = shiny::reactive({ settings$uncertainty_mode() }),
+    uncertainty_results_reactive = shiny::reactive({ values$results_uncertainty })
+  )
+
+  # Load all static data files (everything except assets and companies which come from user-selected folder)
+  # Reuses hazards already loaded by control module to avoid duplicate loading
+  load_all_static_files <- function(base_dir) {
+    tryCatch(
+      {
+        values$status <- "Loading data files..."
+
+        # NOTE: Assets are NOT loaded here - they come from the user-selected input folder
+        # when "Run Analysis" is clicked
+
+        # Reuse hazards and inventory from control module (already loaded for UI)
+        hazards_result <- try(control$hazards_and_inventory(), silent = TRUE)
+        if (inherits(hazards_result, "try-error") || is.null(hazards_result)) {
+          stop("Hazards could not be loaded from control module")
+        }
+        values$hazards <- hazards_result$hazards
+        values$hazards_inventory <- hazards_result$inventory
+        values$hazard_configs <- hazards_result$configs
+
+        # precomputed_hazards and cnae_exposure are always resolved against the Brazil
+        # hazard config, regardless of the active region: both are structurally required
+        # by compute_risk() (non-empty data.frame checks) but are ADM-code / CNAE-code
+        # lookup tables that Global-mode (lat/long-only) assets never actually query.
+        # This keeps Brazil-mode behavior byte-for-byte identical to before.
+        brazil_hazard_configs <- load_hazard_configs(hazards_dir = file.path(base_dir, "hazards", "config"))
+
+        values$precomputed_hazards <- read_precomputed_hazards(base_dir, hazard_configs = brazil_hazard_configs)
+
+        # Load mandatory CNAE exposure mapping (required for sector resolution and validation)
+        mapping_hazards <- names(brazil_hazard_configs)[vapply(
+          brazil_hazard_configs,
+          function(cfg) {
+            !is.null(cfg$mappings) && "cnae_exposure" %in% names(cfg$mappings)
+          },
+          logical(1)
+        )]
+        if (length(mapping_hazards) == 0) {
+          stop("Mandatory mapping 'cnae_exposure' was not found in hazard config files")
+        }
+        values$cnae_exposure <- load_mapping_from_config(
+          base_dir = base_dir,
+          hazard_configs = brazil_hazard_configs,
+          hazard_type = mapping_hazards[[1]],
+          mapping_key = "cnae_exposure"
+        )
+        if (!is.data.frame(values$cnae_exposure) || nrow(values$cnae_exposure) == 0) {
+          stop("Mandatory mapping 'cnae_exposure' is empty or invalid")
+        }
+
+        if (identical(region(), "brazil")) {
+          # Load ADM1 and ADM2 boundaries for state assignment and validation
+          state_path <- file.path(base_dir, "areas", "state", "geoBoundaries-BRA-ADM1_simplified.geojson")
+          municipality_path <- file.path(base_dir, "areas", "municipality", "geoBoundaries-BRA-ADM2_simplified.geojson")
+          adm_codes <- try(load_adm_codes(base_dir), silent = TRUE)
+          if (inherits(adm_codes, "try-error")) {
+            adm_codes <- NULL
+          }
+          values$adm1_boundaries <- sf::st_read(state_path, quiet = TRUE)
+          values$adm2_boundaries <- sf::st_read(municipality_path, quiet = TRUE)
+          values$adm1_boundaries <- repair_adm_boundary_names(values$adm1_boundaries, adm_codes, "adm1")
+          values$adm2_boundaries <- repair_adm_boundary_names(values$adm2_boundaries, adm_codes, "adm2")
+
+          values$spatial_separation_data <- load_spatial_separation_data(
+            base_dir = base_dir,
+            adm1_boundaries = values$adm1_boundaries,
+            adm2_boundaries = values$adm2_boundaries,
+            adm_codes = adm_codes
+          )
+          values$spatial_separation_warnings <- if (
+            !is.null(values$spatial_separation_data) &&
+            "warnings" %in% names(values$spatial_separation_data) &&
+            !is.null(values$spatial_separation_data$warnings)
+          ) {
+            unique(as.character(values$spatial_separation_data$warnings))
+          } else {
+            character()
+          }
+
+          # Load region name mapping for displaying original names in frontend
+          # Pass already loaded boundaries to avoid redundant file reads
+          values$region_name_mapping <- load_region_name_mapping(
+            base_dir,
+            adm1_sf = values$adm1_boundaries,
+            adm2_sf = values$adm2_boundaries
+          )
+        } else {
+          # Global mode: no Brazil ADM boundaries, no hydro-region spatial separation,
+          # no ADM name mapping. compute_risk() cleanly skips the ADM-assignment and
+          # coherence-validation steps when adm1_boundaries is NULL.
+          # Global spatial separation uses the named global basin shapefiles (Flood) and the
+          # geoBoundaries ADM0/1/2 shapefiles (Heat): only their attribute tables are read
+          # here; polygons are loaded lazily on first use (spatial join / status map).
+          values$adm1_boundaries <- NULL
+          values$adm2_boundaries <- NULL
+          values$spatial_separation_data <- load_global_spatial_data(base_dir)
+          values$spatial_separation_warnings <- character()
+          values$region_name_mapping <- NULL
+        }
+
+        values$status <- "Data files loaded. Ready to select input folder and run analysis."
+        values$data_loaded <- TRUE
+      },
+      error = function(e) {
+        log_error_to_console(e, "Loading static data files")
+        values$status <- paste0("Error loading data files: ", conditionMessage(e))
+        values$data_loaded <- FALSE
+      }
+    )
+  }
+
+  # Load all static files when base_dir is set and hazards are available from control module
+  # This loads all files immediately when the app starts with a valid base_dir
+  observe({
+    base_dir <- get_base_dir()
+    hazards_result <- try(control$hazards_and_inventory(), silent = TRUE)
+
+    if (!is.null(base_dir) && base_dir != "" &&
+      !inherits(hazards_result, "try-error") &&
+      !is.null(hazards_result)) {
+      
+      # If we haven't loaded static files yet, load everything
+      if (!values$data_loaded) {
+        load_all_static_files(base_dir)
+      } else {
+        # If already loaded, just update the hazard-related parts that can be changed by overrides
+        # This ensures that when user saves overrides in the settings tab, the analysis uses the new config
+        values$hazards <- hazards_result$hazards
+        values$hazards_inventory <- hazards_result$inventory
+        values$hazard_configs <- hazards_result$configs
+        
+        # ALSO reload precomputed_hazards with new configs to ensure ensemble names and keys are updated
+        # This is critical for assets without coordinates to match the new inventory
+        # (always resolved against the Brazil config regardless of region — see load_all_static_files)
+        brazil_hazard_configs <- load_hazard_configs(hazards_dir = file.path(base_dir, "hazards", "config"))
+        values$precomputed_hazards <- read_precomputed_hazards(base_dir, hazard_configs = brazil_hazard_configs)
+      }
+    } else if (!is.null(base_dir) && base_dir != "") {
+      values$status <- "Loading hazards..."
+    } else {
+      values$status <- "Please set base directory to get started."
+    }
+  })
+
+  # Run analysis when button is clicked
+  observeEvent(control$run_trigger(), {
+    base_dir <- get_base_dir()
+    input_folder <- control$input_folder()
+
+    # Guard clauses
+    if (is.null(base_dir) || base_dir == "") {
+      values$status <- "Error: Base directory is not set. Please restart the app with a valid base_dir."
+      return()
+    }
+    if (is.null(input_folder) || input_folder == "") {
+      values$status <- "Error: Please select an input folder containing asset_information.xlsx/csv (or assets.xlsx/csv), and company_information.xlsx/csv (or financials.xlsx/csv + portfolio.xlsx/csv) files."
+      return()
+    }
+
+    # Check that both required files exist in the selected folder (legacy or new format)
+    file_status <- resolve_input_file_status(input_folder)
+
+    # Check for conflicts (both formats exist, or duplicate xlsx/csv)
+    if (file_status$asset$status == "conflict" || file_status$company$status == "conflict") {
+      conflicts <- c()
+      if (file_status$asset$status == "conflict") conflicts <- c(conflicts, "asset_information/assets")
+      if (file_status$company$status == "conflict") conflicts <- c(conflicts, "company_information/financials+portfolio")
+      values$status <- paste0("Error: Conflicting input files found for: ", paste(conflicts, collapse = ", "), ". Please use only one format per file type.")
+      return()
+    }
+
+    # Check that at least one format exists for each file
+    if (file_status$asset$status == "missing" || file_status$company$status == "missing") {
+      missing <- c()
+      if (file_status$asset$status == "missing") missing <- c(missing, "asset_information.xlsx/csv or assets.xlsx/csv")
+      if (file_status$company$status == "missing") missing <- c(missing, "company_information.xlsx/csv or financials.xlsx/csv + portfolio.xlsx/csv")
+      values$status <- paste0("Error: Missing required files in selected folder: ", paste(missing, collapse = ", "))
+      return()
+    }
+    
+    if (!values$data_loaded || is.null(values$hazards) || length(values$hazards) == 0) {
+      values$status <- "Error: Data files not loaded. Please wait for data to finish loading."
+      return()
+    }
+
+    values$status <- "Running analysis..."
+
+    tryCatch(
+      {
+        analysis_warnings <- character()
+
+        # Load asset and company files from the selected folder
+        values$assets <- read_assets(input_folder)
+        companies <- read_companies(input_folder)
+
+        # Build events from control module (single call; events is a reactiveVal)
+        ev_df <- try(control$events(), silent = TRUE)
+        if (inherits(ev_df, "try-error") || !(tibble::is_tibble(ev_df) || is.data.frame(ev_df)) || nrow(ev_df) == 0) {
+          values$status <- "Error: Please select at least one hazard event before running the analysis. Use the 'Add hazard' button to configure hazard events."
+          return()
+        }
+
+        if (!"calc_mode" %in% names(ev_df)) ev_df$calc_mode <- "deterministic"
+        ev_df$calc_mode <- dplyr::coalesce(ev_df$calc_mode, "deterministic")
+
+        run_mode <- unique(ev_df$calc_mode)
+        if (length(run_mode) > 1) {
+          values$status <- "Error: Cannot mix Deterministic and Probabilistic events in one run — remove one type first."
+          return()
+        }
+        run_mode <- run_mode[[1]]
+
+        # Reconcile events with currently loaded hazards using inventory.
+        # For TIF: inventory.hazard_name matches event.hazard_name (new format)
+        # For NC: inventory.hazard_name matches event.hazard_name (base event without ensemble)
+        # Probabilistic events have a synthetic hazard_name (e.g. "Flood__AAL__...")
+        # that never matches a single raster's name by design -- exempt them here;
+        # their own validity is checked inside compute_risk_probabilistic().
+        if ("hazard_name" %in% names(ev_df) && identical(run_mode, "deterministic")) {
+          inventory_hazard_names <- values$hazards_inventory$hazard_name
+          keep <- ev_df$hazard_name %in% inventory_hazard_names
+          if (any(!keep)) {
+            missing <- unique(ev_df$hazard_name[!keep])
+            message("[app_server] Dropping events with missing hazards: ", paste(missing, collapse = ", "))
+          }
+          ev_df <- ev_df[keep, , drop = FALSE]
+        }
+
+        if (nrow(ev_df) == 0) {
+          values$status <- "Error: No configured events matched the currently loaded hazards. Please review your hazard events."
+          return()
+        }
+
+        run_hazards_dir <- resolve_hazards_dir(base_dir, region())
+
+        if (identical(run_mode, "probabilistic")) {
+          # ------------------------------------------------------------------
+          # PROBABILISTIC (AAL) PATH -- fully separate from the deterministic
+          # path below; never calls compute_risk() or touches its state.
+          # ------------------------------------------------------------------
+          progress <- shiny::Progress$new(session, min = 0, max = 1)
+          progress$set(message = "Running probabilistic (AAL) analysis...", value = 0)
+          on.exit(progress$close(), add = TRUE)
+
+          results <- compute_risk_probabilistic(
+            assets = values$assets,
+            companies = companies,
+            events = ev_df,
+            hazards = values$hazards,
+            hazards_inventory = values$hazards_inventory,
+            hazard_configs = values$hazard_configs,
+            hazards_dir = run_hazards_dir,
+            precomputed_hazards = values$precomputed_hazards,
+            growth_rate = control$growth_rate(),
+            discount_rate = control$discount_rate(),
+            risk_free_rate = control$risk_free_rate(),
+            on_progress = function(value, msg) {
+              progress$set(value = value, detail = msg)
+            }
+          )
+
+          values$results <- results
+          values$results_uncertainty <- NULL
+          values$run_events <- ev_df
+          control$set_results(results)
+          values$status <- "Analysis complete. Check the Profit Pathways and Company Analysis tabs for detailed results."
+
+          updateTabsetPanel(session, "main_tabs", selected = "assets")
+          return()
+        }
+
+        # ------------------------------------------------------------------
+        # DETERMINISTIC PATH -- unchanged from the existing single-event-year
+        # behavior (uncertainty mode, compute_risk(), everything below).
+        # ------------------------------------------------------------------
+
+        # Run the complete climate risk analysis using pre-loaded data
+        use_uncertainty <- isTRUE(settings$uncertainty_mode())
+        # uncertainty = 3 runs (P10, Median, P90); normal = 1 run (mean)
+        progress_max <- if (use_uncertainty) 3 else 1
+        progress <- shiny::Progress$new(session, min = 0, max = progress_max)
+        progress$set(message = "Running analysis...", value = 0)
+        on.exit(progress$close(), add = TRUE)
+
+        # Load NC hazards for a specific ensemble target. TIF hazards (flood) don't
+        # have an ensemble dimension so they use the default hazards object.
+        # Returns list(hazards, inventory) with the target ensemble's rasters and keys.
+        # (run_hazards_dir computed once above, shared by both calc-mode branches)
+
+        load_unc_hazards <- function(target_ensemble) {
+          result <- try(load_hazards_and_inventory(
+            hazards_dir        = run_hazards_dir,
+            hazard_indicators_dir = file.path(base_dir, "hazards", "indicators"),
+            hazards_override_path = file.path(run_hazards_dir, "config_overrides.yml"),
+            aggregate_factor   = 1L,
+            ensemble_filter    = target_ensemble
+          ), silent = TRUE)
+          if (inherits(result, "try-error")) {
+            message("[uncertainty] Failed to load hazards for ensemble=", target_ensemble, "; falling back to mean")
+            return(list(hazards = values$hazards, inventory = values$hazards_inventory))
+          }
+          list(hazards = result$hazards, inventory = result$inventory)
+        }
+
+        # For non-NC hazards (TIF/flood), override spatial aggregation method.
+        # NC hazards use the ensemble dimension for uncertainty, not the agg column.
+        make_unc_inventory <- function(inventory, quantile) {
+          if (is.null(inventory) || !"agg" %in% names(inventory)) return(inventory)
+          is_cat <- if ("categorical" %in% names(inventory)) {
+            vapply(inventory$categorical, isTRUE, logical(1))
+          } else {
+            rep(FALSE, nrow(inventory))
+          }
+          is_nc <- if ("source" %in% names(inventory)) {
+            inventory$source == "nc"
+          } else {
+            rep(FALSE, nrow(inventory))
+          }
+          inventory$agg <- ifelse(is_cat | is_nc, inventory$agg, quantile)
+          inventory
+        }
+
+        run_one <- function(agg_method, progress_offset, progress_label,
+                            hazards_inv = values$hazards_inventory,
+                            hazards_obj = values$hazards) {
+          withCallingHandlers(
+            compute_risk(
+              assets = values$assets,
+              companies = companies,
+              events = ev_df,
+              hazards = hazards_obj,
+              hazards_inventory = hazards_inv,
+              precomputed_hazards = values$precomputed_hazards,
+              hazard_configs = values$hazard_configs,
+              hazards_dir = run_hazards_dir,
+              cnae_exposure = values$cnae_exposure,
+              adm1_boundaries = values$adm1_boundaries,
+              adm2_boundaries = values$adm2_boundaries,
+              spatial_separation_data = values$spatial_separation_data,
+              base_dir = base_dir,
+              validate_inputs = TRUE,
+              growth_rate = control$growth_rate(),
+              discount_rate = control$discount_rate(),
+              risk_free_rate = control$risk_free_rate(),
+              aggregation_method = agg_method,
+              on_progress = function(value, msg) {
+                progress$set(value = progress_offset + value, detail = paste0(progress_label, ": ", msg))
+              }
+            ),
+            warning = function(w) {
+              warning_msg <- conditionMessage(w)
+              if (startsWith(warning_msg, "[spatial_separation]")) {
+                analysis_warnings <<- unique(c(analysis_warnings, warning_msg))
+              }
+            }
+          )
+        }
+
+        if (use_uncertainty) {
+          # For each quantile: load ensemble-specific NC rasters, override TIF agg
+          unc_p10    <- load_unc_hazards("p10")
+          unc_median <- load_unc_hazards("median")
+          unc_p90    <- load_unc_hazards("p90")
+
+          results_p10    <- run_one("p10",    0, "P10",
+            make_unc_inventory(unc_p10$inventory,    "p10"),    unc_p10$hazards)
+          results_median <- run_one("median", 1, "Median",
+            make_unc_inventory(unc_median$inventory, "median"), unc_median$hazards)
+          results_p90    <- run_one("p90",    2, "P90",
+            make_unc_inventory(unc_p90$inventory,    "p90"),    unc_p90$hazards)
+          values$results_uncertainty <- list(
+            median = results_median,
+            p10    = results_p10,
+            p90    = results_p90
+          )
+          results <- results_median
+        } else {
+          results <- run_one("mean", 0, "Analysis")
+          values$results_uncertainty <- NULL
+        }
+
+        values$results <- results
+        values$run_events <- ev_df
+        control$set_results(results)
+        values$status <- "Analysis complete. Check the Profit Pathways and Company Analysis tabs for detailed results."
+        analysis_warnings <- unique(c(analysis_warnings, values$spatial_separation_warnings))
+        if (length(analysis_warnings) > 0) {
+          cleaned_warnings <- sub("^\\[spatial_separation\\]\\s*", "", analysis_warnings)
+          values$status <- paste(
+            values$status,
+            "Spatial separation warning:",
+            paste(cleaned_warnings, collapse = " ")
+          )
+        }
+
+        # Switch to pathways tab after completion
+        updateTabsetPanel(session, "main_tabs", selected = "assets")
+      },
+      error = function(e) {
+        log_error_to_console(e, "Main app analysis")
+        values$status <- paste0("Error during analysis: ", conditionMessage(e))
+      }
+    )
+  })
+}

@@ -1,0 +1,54 @@
+Package: climate.risk.tool
+Title: Physical Climate Risk Assessment for Financial Portfolios
+Version: 0.0.0.9000
+Authors@R: 
+    person("Theia Finance Labs",
+           role = c("aut", "cre", "cph"),
+           email = "antonio@theiafinance.org")
+Description: Assesses physical climate risk for financial portfolios.
+    Asset locations are overlaid with geospatial hazard data (GeoTIFF,
+    NetCDF and CSV), hazard intensities are translated into damages and
+    revenue and profit impacts, and these are aggregated to company level
+    to derive net present value, probability of default (Merton model)
+    and expected loss under climate scenarios. Includes an interactive
+    Shiny application.
+License: MIT + file LICENSE
+Imports:
+    config,
+    dplyr (>= 1.0.0),
+    DT,
+    golem,
+    ncdf4,
+    purrr,
+    rlang,
+    RColorBrewer,
+    readr,
+    readxl,
+    sf,
+    shiny,
+    shinyFiles,
+    stringr,
+    stringi,
+    terra,
+    tibble,
+    tidyr,
+    tools,
+    writexl,
+    plotly,
+    yaml
+Encoding: UTF-8
+LazyData: true
+RoxygenNote: 7.3.3
+Roxygen: list(markdown = TRUE)
+Suggests: 
+    devtools,
+    exactextractr,
+    here,
+    knitr,
+    rmarkdown,
+    testthat (>= 3.0.0),
+    shinytest2,
+    htmltools,
+    rprojroot
+Config/testthat/edition: 3
+VignetteBuilder: knitr

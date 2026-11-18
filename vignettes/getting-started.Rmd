@@ -1,0 +1,215 @@
+---
+title: "getting-started"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{getting-started}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  eval = FALSE # Don't evaluate code chunks - this is a usage guide
+)
+```
+
+```{r setup}
+library(climate.risk.tool)
+
+# Set the path to your data directory
+# This should contain:
+# - user_input/asset_information.xlsx
+# - user_input/company_information.xlsx
+# - hazards/[hazard_type]/*.tif or *.nc files (supports both formats)
+# - damage_and_cost_factors.csv
+# - hazards/precomputed_adm_indicators.csv (precomputed hazard statistics for regions)
+# - hazards_name_mapping.csv (metadata for TIF hazards, optional for NC)
+base_dir <- file.path("..", "tests", "tests_data")
+```
+
+## Prepare inputs
+
+Load all required data from your base directory:
+
+```{r}
+# Load all required data
+assets <- read_assets(file.path(base_dir, "user_input"))
+companies <- read_companies(file.path(base_dir, "user_input"))
+
+# Load hazards with unified loader (supports both TIF and NetCDF formats)
+hazard_data <- load_hazards_and_inventory(
+  hazards_dir = file.path(base_dir, "hazards", "config"),
+  hazard_indicators_dir = file.path(base_dir, "hazards", "indicators"),
+  aggregate_factor = 16L
+)
+hazards <- c(hazard_data$hazards$tif, hazard_data$hazards$nc, hazard_data$hazards$csv) # Flatten for compute_risk
+hazards_inventory <- hazard_data$inventory
+hazard_configs <- hazard_data$configs
+hazards_dir <- file.path(base_dir, "hazards", "config")
+
+# Load precomputed hazard statistics for administrative regions
+precomputed_hazards <- read_precomputed_hazards(base_dir)
+```
+
+## Explore hazard inventory
+
+Before defining events, let's examine what hazards are available:
+
+```{r}
+# Display available hazards for user selection (reusing already loaded data)
+inventory <- hazard_data$inventory
+
+# Show summary of available hazard types
+cat("Available Hazard Types:\n")
+print(inventory |> dplyr::group_by(hazard_type, source) |>
+  dplyr::summarise(count = dplyr::n(), .groups = "drop"))
+
+# Show detailed inventory for user selection
+cat("\nDetailed Hazard Inventory (first 10 rows):\n")
+print(inventory |> head(10))
+
+# Show all available hazard names for reference
+cat("\nAll Available Hazard Names (for copy-paste in events):\n")
+cat("TIF Hazards:\n")
+cat(paste(names(hazard_data$hazards$tif), collapse = "\n"))
+cat("\n\nNC Hazards (base names, ensemble expansion happens automatically):\n")
+nc_base_names <- unique(sub("__ensemble=.*$", "", names(hazard_data$hazards$nc)))
+cat(paste(nc_base_names, collapse = "\n"))
+```
+
+## Define events
+
+Define the climate scenarios you want to analyze. You can mix different hazard types:
+
+```{r}
+# Create events mixing flood and drought hazards
+events <- data.frame(
+  hazard_type = c("Flood", "Flood", "Heat", "Heat"),
+  hazard_name = c(
+    "Flood__depth(cm)__GWL=CurrentClimate__RP=10",
+    "Flood__depth(cm)__GWL=CurrentClimate__RP=10",
+    # Heat CSV hazards use indicator 'HI' (Heat Index) in our data
+    "Compound__HI__GWL=present__RP=10__ensemble=mean",
+    "Compound__HI__GWL=3__RP=10__ensemble=mean"
+  ),
+  scenario_name = c("CurrentClimate", "CurrentClimate", "present", "3"),
+  scenario_code = c("pc", "pc", "present", "3"),
+  hazard_return_period = c(10, 10, 10, 10),
+  event_year = c(2030L, 2030L, 2030L, 2035L),
+  stringsAsFactors = FALSE
+)
+```
+
+## Run the model
+
+Run the complete climate risk analysis pipeline:
+
+```{r}
+# Run the complete climate risk analysis
+results <- compute_risk(
+  assets = assets,
+  companies = companies,
+  events = events,
+  hazards = hazards,
+  hazards_inventory = hazards_inventory,
+  precomputed_hazards = precomputed_hazards,
+  hazard_configs = hazard_configs,
+  hazards_dir = hazards_dir,
+  growth_rate = 0.02,
+  discount_rate = 0.05,
+  risk_free_rate = 0.02
+)
+```
+
+
+
+## Explore results
+
+The results object contains multiple dataframes with different levels of detail:
+
+### Assets hazard exposure and damage factors
+
+Shows how each asset is exposed to different hazards:
+
+```{r}
+results$assets_factors
+```
+
+### Assets yearly profits trajectory
+
+Detailed year-by-year profit projections for each asset under different scenarios:
+
+```{r}
+results$assets_yearly
+```
+
+### Companies yearly profits trajectory
+
+Aggregated year-by-year profit projections at the company level:
+
+```{r}
+results$companies_yearly
+```
+
+### Assets aggregated financials
+
+Summary NPV metrics for each asset by scenario:
+
+```{r}
+results$assets
+```
+
+### Companies aggregated financials
+
+Final company-level risk metrics including NPV, Probability of Default (PD), and Expected Loss:
+
+```{r}
+results$companies
+```
+
+## New Features: NetCDF Support
+
+The package now supports NetCDF (.nc) files in addition to GeoTIFF (.tif) files:
+
+### NetCDF Hazard Files
+
+NetCDF files provide several advantages:
+- **Pre-computed ensemble statistics** (mean, median, p10, p90) - no spatial computation needed
+- **Multiple variables per file** with automatic variable selection
+- **Auto-discovery** from directory structure and file dimensions
+
+### Hazard Data Formats
+
+**GeoTIFF (.tif) Files** (Traditional)
+- Require `hazards_name_mapping.csv` for metadata
+- Spatial extraction computes statistics from pixel values
+- Naming: `flood__rcp85_h100glob`
+
+**NetCDF (.nc) Files** (New)
+- Auto-discover from directory structure: `hazards/{hazard_type}/{indicator}/{model_type}/`
+- Direct extraction of pre-computed statistics
+- Naming: `CDD__ensemble__GWL=unknown__RP=10__ensemble=mean`
+
+### Ensemble Expansion
+
+For NetCDF hazards, the `filter_hazards_by_events()` function automatically expands base event names to include ALL ensemble variants:
+
+- Input: `"CDD__ensemble__GWL=unknown__RP=10"` (base event name)
+- Expands to: 4 rasters (mean, median, p10, p90)
+- Enables complete statistics extraction without spatial computation
+
+This expansion happens automatically - you only need to specify the base event name without the final `__ensemble=` suffix.
+
+### Updated Function Signatures
+
+Key functions have been updated to support both data formats:
+
+- `load_hazards_and_inventory()` - Unified loader for TIF + NC files
+- `compute_risk()` - Now requires `hazards_inventory` parameter
+- `filter_hazards_by_events()` - Smart filtering with ensemble expansion
+- `extract_hazard_statistics()` - Dual workflow for TIF vs NC sources
+
+
+

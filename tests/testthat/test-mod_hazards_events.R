@@ -1,0 +1,463 @@
+testthat::test_that("mod_hazards_events_ui renders static placeholders and controls", {
+  ui <- mod_hazards_events_ui("hz")
+  html <- htmltools::renderTags(ui)$html
+  testthat::expect_true(grepl("hz-events_ui", html))
+  testthat::expect_true(grepl("Hazard events", html))
+  testthat::expect_true(grepl("hz-upload_hazard_config", html))
+  testthat::expect_true(grepl("hz-download_config", html))
+})
+testthat::test_that("mod_hazards_events_server loads events via load_config function", {
+  testthat::skip_on_ci()
+  testthat::skip_if_not_installed("shiny")
+
+  inventory_df <- tibble::tibble(
+    hazard_type = c("Heat"),
+    hazard_indicator = c("hi"),
+    scenario_name = c("GWL=2.0"),
+    return_period = c(50),
+    hazard_name = c("Heat__hi__GWL=2.0__RP=50__ensemble=mean")
+  )
+
+  config_df <- tibble::tibble(
+    hazard_type = "Heat",
+    scenario_name = "GWL=2.0",
+    return_period = 50,
+    event_year = 2040,
+    season = NA_character_
+  )
+
+  tmp <- tempfile(fileext = ".xlsx")
+  writexl::write_xlsx(config_df, tmp)
+
+      hazard_configs <- list(
+    Heat = list(
+      primary_indicator = "hi",
+      indicators = list(hi = list(index = c("scenario_name", "return_period")))
+    )
+  )
+  shiny::testServer(mod_hazards_events_server, args = list(
+    id = "hz",
+    hazards_inventory = shiny::reactive(inventory_df),
+    hazard_configs = shiny::reactive(hazard_configs)
+  ), {
+    ret <- session$returned
+    load_config_fn <- ret$load_config
+    load_config_fn(tmp)
+
+    ev <- events_rv()
+    testthat::expect_equal(nrow(ev), 1)
+    testthat::expect_equal(ev$hazard_type[1], "Heat")
+    testthat::expect_equal(ev$scenario_name[1], "GWL=2.0")
+    testthat::expect_equal(ev$return_period[1], 50)
+    testthat::expect_equal(ev$event_year[1], 2040L)
+    testthat::expect_true(is.na(ev$season[1]))
+    testthat::expect_equal(ev$hazard_indicator[1], "hi")
+    testthat::expect_equal(ev$hazard_name[1], "Heat__hi__GWL=2.0__RP=50__ensemble=mean")
+  })
+})
+
+
+testthat::test_that("mod_hazards_events_server exposes events reactive", {
+  testthat::skip_on_ci()
+  testthat::skip_if_not_installed("shiny")
+  hazard_configs <- list(
+    Flood = list(
+      primary_indicator = "depth",
+      indicators = list(depth = list(index = c("scenario_name", "return_period")))
+    )
+  )
+  shiny::testServer(mod_hazards_events_server, args = list(
+    id = "hz",
+    hazards_inventory = shiny::reactive({
+      data.frame(
+        hazard_type = c("Flood", "Flood"),
+        hazard_indicator = c("depth", "depth"),
+                scenario_name = c("rcp85", "rcp85"),
+        return_period = c(100, 10),
+        hazard_name = c(
+          "Flood__depth__GWL=rcp85__RP=100__ensemble=mean",
+          "Flood__depth__GWL=rcp85__RP=10__ensemble=mean"
+        ),
+        stringsAsFactors = FALSE
+      )
+    }),
+    hazard_configs = shiny::reactive(hazard_configs)
+  ), {
+    # Initially, one form is present (k=1)
+    testthat::expect_equal(counter(), 1L)
+
+    # No events added yet
+    testthat::expect_equal(nrow(events_rv()), 0)
+
+    # Provide selections for the first event
+    session$setInputs("hazard_type_1" = "Flood")
+    session$setInputs("filter_1_scenario_name" = "rcp85")
+    session$setInputs("filter_1_return_period" = 100)
+    session$setInputs("year_1" = 2030)
+
+    # First click of add_event should save the current event and increment counter
+    session$setInputs(add_event = 1)
+
+    testthat::expect_equal(nrow(events_rv()), 1)
+    testthat::expect_equal(counter(), 2L)
+
+    # Add a second event
+    session$setInputs("hazard_type_2" = "Flood")
+    session$setInputs("filter_2_scenario_name" = "rcp85")
+    session$setInputs("filter_2_return_period" = 10)
+    session$setInputs("year_2" = 2035)
+    session$setInputs(add_event = 2)
+
+    ret <- session$returned
+    ev_fun <- ret$events
+    ev <- ev_fun()
+    testthat::expect_true(is.data.frame(ev))
+    testthat::expect_gte(nrow(ev), 2) # Now expecting 2 events
+  })
+})
+
+testthat::test_that("mod_hazards_events_server adds a probabilistic (AAL) event with return_period/event_year left NA", {
+  testthat::skip_on_ci()
+  testthat::skip_if_not_installed("shiny")
+  hazard_configs <- list(
+    Flood = list(
+      primary_indicator = "depth",
+      indicators = list(depth = list(index = c("scenario_name", "return_period")))
+    )
+  )
+  shiny::testServer(mod_hazards_events_server, args = list(
+    id = "hz",
+    hazards_inventory = shiny::reactive({
+      data.frame(
+        hazard_type = c("Flood", "Flood"),
+        hazard_indicator = c("depth", "depth"),
+        scenario_name = c("rcp85", "rcp85"),
+        return_period = c(100, 10),
+        hazard_name = c(
+          "Flood__depth__GWL=rcp85__RP=100__ensemble=mean",
+          "Flood__depth__GWL=rcp85__RP=10__ensemble=mean"
+        ),
+        stringsAsFactors = FALSE
+      )
+    }),
+    hazard_configs = shiny::reactive(hazard_configs)
+  ), {
+    session$setInputs("calc_mode_1" = "probabilistic")
+    session$setInputs("hazard_type_1" = "Flood")
+    session$setInputs("filter_1_scenario_name" = "rcp85")
+    session$setInputs(add_event = 1)
+
+    ev <- events_rv()
+    testthat::expect_equal(nrow(ev), 1)
+    testthat::expect_equal(ev$calc_mode[1], "probabilistic")
+    testthat::expect_equal(ev$hazard_type[1], "Flood")
+    testthat::expect_equal(ev$scenario_name[1], "rcp85")
+    testthat::expect_true(is.na(ev$return_period[1]))
+    testthat::expect_true(is.na(ev$event_year[1]))
+    testthat::expect_equal(ev$spatial_level[1], "brazil")
+  })
+})
+
+testthat::test_that("mod_hazards_events_server rejects probabilistic mode for hazards without an AAL engine", {
+  testthat::skip_on_ci()
+  testthat::skip_if_not_installed("shiny")
+  hazard_configs <- list(
+    Heat = list(
+      primary_indicator = "hi",
+      indicators = list(hi = list(index = c("scenario_name", "return_period")))
+    )
+  )
+  shiny::testServer(mod_hazards_events_server, args = list(
+    id = "hz",
+    hazards_inventory = shiny::reactive({
+      data.frame(
+        hazard_type = "Heat",
+        hazard_indicator = "hi",
+        scenario_name = "rcp85",
+        return_period = 50,
+        hazard_name = "Heat__hi__GWL=rcp85__RP=50__ensemble=mean",
+        stringsAsFactors = FALSE
+      )
+    }),
+    hazard_configs = shiny::reactive(hazard_configs)
+  ), {
+    session$setInputs("calc_mode_1" = "probabilistic")
+    session$setInputs("hazard_type_1" = "Heat")
+    session$setInputs("filter_1_scenario_name" = "rcp85")
+    session$setInputs(add_event = 1)
+
+    # Heat has no Probabilistic/AAL engine in v1 -- the event must not be added.
+    ev <- events_rv()
+    testthat::expect_equal(nrow(ev), 0)
+  })
+})
+
+testthat::test_that("mod_hazards_events_server deterministic events are tagged calc_mode = 'deterministic'", {
+  testthat::skip_on_ci()
+  testthat::skip_if_not_installed("shiny")
+  hazard_configs <- list(
+    Flood = list(
+      primary_indicator = "depth",
+      indicators = list(depth = list(index = c("scenario_name", "return_period")))
+    )
+  )
+  shiny::testServer(mod_hazards_events_server, args = list(
+    id = "hz",
+    hazards_inventory = shiny::reactive({
+      data.frame(
+        hazard_type = "Flood",
+        hazard_indicator = "depth",
+        scenario_name = "rcp85",
+        return_period = 100,
+        hazard_name = "Flood__depth__GWL=rcp85__RP=100__ensemble=mean",
+        stringsAsFactors = FALSE
+      )
+    }),
+    hazard_configs = shiny::reactive(hazard_configs)
+  ), {
+    # calc_mode_1 not set -- must still default to deterministic, exactly as
+    # before this feature existed (backward compatibility for existing behavior).
+    session$setInputs("hazard_type_1" = "Flood")
+    session$setInputs("filter_1_scenario_name" = "rcp85")
+    session$setInputs("filter_1_return_period" = 100)
+    session$setInputs("year_1" = 2030)
+    session$setInputs(add_event = 1)
+
+    ev <- events_rv()
+    testthat::expect_equal(nrow(ev), 1)
+    testthat::expect_equal(ev$calc_mode[1], "deterministic")
+    testthat::expect_equal(ev$return_period[1], 100)
+    testthat::expect_equal(ev$event_year[1], 2030L)
+  })
+})
+
+testthat::test_that("mod_hazards_events_server uses preloaded spatial data when provided", {
+  testthat::skip_on_ci()
+  testthat::skip_if_not_installed("shiny")
+  testthat::skip_if_not_installed("sf")
+
+  hazard_configs <- list(
+    Flood = list(
+      primary_indicator = "depth",
+      spatial_separation_scheme = "hydro_regions",
+      indicators = list(depth = list(index = c("scenario_name", "return_period")))
+    )
+  )
+
+  preloaded_spatial <- list(
+    adm = list(state = NULL, municipality = NULL),
+    hydro = list(
+      macro = sf::st_sf(
+        region_code = "R1",
+        region_label = "Region 1",
+        geometry = sf::st_sfc(
+          sf::st_polygon(list(rbind(c(0, 0), c(1, 0), c(1, 1), c(0, 1), c(0, 0)))),
+          crs = 4326
+        )
+      ),
+      meso = NULL,
+      micro = NULL
+    ),
+    overlaps = list(),
+    lookup = list(state_name_to_code = c(), municipality_name_to_code = c()),
+    warnings = "[spatial_separation] Repaired 1 invalid geometry in Macro hydro spatial separation layer."
+  )
+
+  shiny::testServer(mod_hazards_events_server, args = list(
+    id = "hz",
+    hazards_inventory = shiny::reactive({
+      data.frame(
+        hazard_type = "Flood",
+        hazard_indicator = "depth",
+        scenario_name = "rcp85",
+        return_period = 100,
+        hazard_name = "Flood__depth__GWL=rcp85__RP=100__ensemble=mean",
+        stringsAsFactors = FALSE
+      )
+    }),
+    hazard_configs = shiny::reactive(hazard_configs),
+    base_dir_reactive = shiny::reactive(""),
+    spatial_data_reactive = shiny::reactive(preloaded_spatial)
+  ), {
+    loaded <- spatial_data()
+    testthat::expect_false(is.null(loaded))
+    testthat::expect_equal(loaded$hydro$macro$region_code[[1]], "R1")
+    testthat::expect_equal(loaded$warnings[[1]], preloaded_spatial$warnings[[1]])
+  })
+})
+
+testthat::test_that("mod_hazards_events_server shows only one form at a time", {
+  testthat::skip_on_ci()
+  testthat::skip_if_not_installed("shiny")
+  hazard_configs <- list(
+    Flood = list(
+      primary_indicator = "depth",
+      indicators = list(depth = list(index = c("scenario_name", "return_period")))
+    )
+  )
+  shiny::testServer(mod_hazards_events_server, args = list(
+    id = "hz",
+    hazards_inventory = shiny::reactive({
+      data.frame(
+        hazard_type = c("Flood", "Flood"),
+        hazard_indicator = c("depth", "depth"),
+                scenario_name = c("rcp85", "rcp85"),
+        return_period = c(100, 10),
+        hazard_name = c(
+          "Flood__depth__GWL=rcp85__RP=100__ensemble=mean",
+          "Flood__depth__GWL=rcp85__RP=10__ensemble=mean"
+        ),
+        stringsAsFactors = FALSE
+      )
+    }),
+    hazard_configs = shiny::reactive(hazard_configs)
+  ), {
+    # Initially, one form is present (hazard_type_1, scenario_1, return_period_1)
+    ui_html <- htmltools::renderTags(output$events_ui)$html
+    testthat::expect_true(grepl("hazard_type_1", ui_html))
+    testthat::expect_false(grepl("hazard_type_2", ui_html))
+
+    # Add first event
+    session$setInputs("hazard_type_1" = "Flood")
+    session$setInputs("filter_1_scenario_name" = "rcp85")
+    session$setInputs("filter_1_return_period" = 100)
+    session$setInputs("year_1" = 2030)
+    session$setInputs(add_event = 1) # This is now the first 'add_event' click
+
+    # After adding event, should still show only one form (now hazard_type_2, not hazard_type_1)
+    ui_html <- htmltools::renderTags(output$events_ui)$html
+    testthat::expect_true(grepl("hazard_type_2", ui_html))
+    testthat::expect_false(grepl("hazard_type_1", ui_html))
+  })
+})
+
+testthat::test_that("mod_hazards_events_server captures season for Drought events", {
+  testthat::skip_on_ci()
+  testthat::skip_if_not_installed("shiny")
+  hazard_configs <- list(
+    Drought = list(
+      primary_indicator = "spi3",
+      indicators = list(spi3 = list(index = c("scenario_name", "return_period", "season")))
+    )
+  )
+  shiny::testServer(mod_hazards_events_server, args = list(
+    id = "hz",
+    hazards_inventory = shiny::reactive({
+      data.frame(
+        hazard_type = c("Drought"),
+        hazard_indicator = c("spi3"),
+        scenario_name = c("present"),
+        return_period = c(10),
+        hazard_name = c("Drought__spi3__GWL=present__RP=10__ensemble=mean"),
+        stringsAsFactors = FALSE
+      )
+    }),
+    hazard_configs = shiny::reactive(hazard_configs)
+  ), {
+    # Set up drought event with season
+    session$setInputs("hazard_type_1" = "Drought")
+    session$setInputs("filter_1_scenario_name" = "present")
+    session$setInputs("filter_1_return_period" = 10)
+    session$setInputs("filter_1_season" = "Summer")
+    session$setInputs("year_1" = 2030)
+    session$setInputs(add_event = 1)
+
+    # Check that event was created with season
+    ev <- events_rv()
+    testthat::expect_equal(nrow(ev), 1)
+    testthat::expect_equal(ev$season[1], "Summer")
+    testthat::expect_equal(ev$hazard_type[1], "Drought")
+  })
+})
+
+testthat::test_that("mod_hazards_events_server sets season to NA for non-Drought events", {
+  testthat::skip_on_ci()
+  testthat::skip_if_not_installed("shiny")
+  hazard_configs <- list(
+    Flood = list(
+      primary_indicator = "depth",
+      indicators = list(depth = list(index = c("scenario_name", "return_period")))
+    )
+  )
+  shiny::testServer(mod_hazards_events_server, args = list(
+    id = "hz",
+    hazards_inventory = shiny::reactive({
+      data.frame(
+        hazard_type = c("Flood"),
+        hazard_indicator = c("depth"),
+        scenario_name = c("rcp85"),
+        return_period = c(100),
+        hazard_name = c("Flood__depth__GWL=rcp85__RP=100__ensemble=mean"),
+        stringsAsFactors = FALSE
+      )
+    }),
+    hazard_configs = shiny::reactive(hazard_configs)
+  ), {
+    # Set up flood event (no season should be captured)
+    session$setInputs("hazard_type_1" = "Flood")
+    session$setInputs("filter_1_scenario_name" = "rcp85")
+    session$setInputs("filter_1_return_period" = 100)
+    session$setInputs("year_1" = 2030)
+    session$setInputs(add_event = 1)
+
+    # Check that event was created with NA season
+    ev <- events_rv()
+    testthat::expect_equal(nrow(ev), 1)
+    testthat::expect_true(is.na(ev$season[1]))
+    testthat::expect_equal(ev$hazard_type[1], "Flood")
+  })
+})
+
+testthat::test_that("mod_hazards_events_server adds global drought events (deterministic with season, probabilistic without)", {
+  testthat::skip_on_ci()
+  testthat::skip_if_not_installed("shiny")
+  fx <- make_drought_test_root()
+  inv <- suppressMessages(load_hazards_and_inventory(fx$config_dir, fx$indicators_dir, aggregate_factor = 1L))
+  shiny::testServer(mod_hazards_events_server, args = list(
+    id = "hz",
+    hazards_inventory = shiny::reactive(inv$inventory),
+    hazard_configs = shiny::reactive(inv$configs),
+    region_reactive = shiny::reactive("global")
+  ), {
+    # season choices are offered in calendar order
+    session$setInputs("hazard_type_1" = "Drought")
+    html <- htmltools::renderTags(output[["dynamic_filters_ui_1"]]$html)$html
+    pos <- vapply(c("DJF", "MAM", "JJA", "SON"), function(s) regexpr(paste0(">", s, "<"), html)[[1]], numeric(1))
+    testthat::expect_true(all(pos > 0))
+    testthat::expect_true(all(diff(pos) > 0))
+
+    session$setInputs("filter_1_scenario_name" = "ssp126")
+    session$setInputs("filter_1_season" = "JJA")
+    session$setInputs("filter_1_return_period" = 25)
+    session$setInputs("filter_1_statistic" = "p90")
+    session$setInputs("year_1" = 2040)
+    session$setInputs(add_event = 1)
+
+    ev <- events_rv()
+    testthat::expect_equal(nrow(ev), 1)
+    testthat::expect_equal(ev$hazard_type[1], "Drought")
+    testthat::expect_equal(ev$season[1], "JJA")
+    testthat::expect_equal(ev$statistic[1], "p90")
+    testthat::expect_equal(ev$return_period[1], 25)
+    testthat::expect_equal(ev$event_year[1], 2040L)
+    testthat::expect_equal(ev$calc_mode[1], "deterministic")
+    testthat::expect_equal(ev$spatial_scheme[1], "global_adm")
+    testthat::expect_true(ev$hazard_name[1] %in% inv$inventory$hazard_name)
+    testthat::expect_match(ev$hazard_name[1], "season=JJA")
+
+    # probabilistic: no season / return period filters, all seasons integrated
+    session$setInputs("calc_mode_2" = "probabilistic")
+    session$setInputs("hazard_type_2" = "Drought")
+    html2 <- htmltools::renderTags(output[["dynamic_filters_ui_2"]]$html)$html
+    testthat::expect_false(grepl("filter_2_season", html2))
+    testthat::expect_false(grepl("filter_2_return_period", html2))
+    session$setInputs("filter_2_scenario_name" = "ssp585")
+    session$setInputs("filter_2_statistic" = "median")
+    session$setInputs(add_event = 2)
+    ev <- events_rv()
+    testthat::expect_equal(nrow(ev), 2)
+    testthat::expect_equal(ev$calc_mode[2], "probabilistic")
+    testthat::expect_true(is.na(ev$season[2]))
+    testthat::expect_equal(ev$statistic[2], "median")
+  })
+})
